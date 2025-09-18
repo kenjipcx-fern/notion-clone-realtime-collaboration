@@ -1,0 +1,229 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { db } from '@/db/connection';
+import { pages, workspaces, userWorkspaces, blocks } from '@/db/schema';
+import { eq, and, desc, count, isNull } from 'drizzle-orm';
+
+/**
+ * GET /api/pages
+ * Fetch recent pages across all workspaces for the current user
+ */
+export async function GET(request: NextRequest) {
+  try {
+    const { searchParams } = new URL(request.url);
+    const workspaceId = searchParams.get('workspace_id');
+    const limit = parseInt(searchParams.get('limit') || '10');
+    const offset = parseInt(searchParams.get('offset') || '0');
+
+    // TODO: Get actual user ID from authentication
+    const userId = '1064ba4f-b2cb-4ecb-8651-25b0bc207f3c'; // Alice Cooper's ID
+
+    let pagesQuery = db
+      .select({
+        page: pages,
+        workspace: workspaces,
+        blockCount: count(blocks.id),
+      })
+      .from(pages)
+      .innerJoin(workspaces, eq(pages.workspace_id, workspaces.id))
+      .innerJoin(userWorkspaces, eq(workspaces.id, userWorkspaces.workspace_id))
+      .leftJoin(blocks, and(eq(blocks.page_id, pages.id), eq(blocks.is_deleted, false)))
+      .where(
+        and(
+          eq(userWorkspaces.user_id, userId),
+          eq(pages.is_archived, false)
+        )
+      )
+      .groupBy(pages.id, workspaces.id)
+      .orderBy(desc(pages.updated_at))
+      .limit(limit)
+      .offset(offset);
+
+    // Filter by workspace if specified
+    if (workspaceId) {
+      pagesQuery = pagesQuery.where(
+        and(
+          eq(userWorkspaces.user_id, userId),
+          eq(pages.workspace_id, workspaceId),
+          eq(pages.is_archived, false)
+        )
+      );
+    }
+
+    const recentPages = await pagesQuery;
+
+    // Get additional metadata for each page
+    const pagesWithMetadata = await Promise.all(
+      recentPages.map(async ({ page, workspace, blockCount }) => {
+        // Get child pages count
+        const [childPagesResult] = await db
+          .select({ count: count() })
+          .from(pages)
+          .where(
+            and(
+              eq(pages.parent_id, page.id),
+              eq(pages.is_archived, false)
+            )
+          );
+
+        return {
+          ...page,
+          workspace: {
+            id: workspace.id,
+            name: workspace.name,
+            icon: workspace.icon,
+            slug: workspace.slug,
+          },
+          block_count: blockCount,
+          child_pages_count: childPagesResult.count,
+        };
+      })
+    );
+
+    const response = {
+      success: true,
+      data: pagesWithMetadata,
+      message: `Found ${pagesWithMetadata.length} pages`,
+      pagination: {
+        limit,
+        offset,
+        has_more: pagesWithMetadata.length === limit,
+      },
+    };
+
+    return NextResponse.json(response, { status: 200 });
+  } catch (error) {
+    console.error('Error fetching pages:', error);
+    
+    return NextResponse.json(
+      {
+        success: false,
+        error: 'Failed to fetch pages',
+        details: process.env.NODE_ENV === 'development' ? error : undefined,
+      },
+      { status: 500 }
+    );
+  }
+}
+
+/**
+ * POST /api/pages
+ * Create a new page
+ */
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const { title, workspace_id, parent_id, icon, template_id } = body;
+
+    // TODO: Get actual user ID from authentication
+    const userId = '1064ba4f-b2cb-4ecb-8651-25b0bc207f3c'; // Alice Cooper's ID
+
+    // Validation
+    if (!title || title.trim().length === 0) {
+      return NextResponse.json(
+        { success: false, error: 'Page title is required' },
+        { status: 400 }
+      );
+    }
+
+    if (!workspace_id) {
+      return NextResponse.json(
+        { success: false, error: 'Workspace ID is required' },
+        { status: 400 }
+      );
+    }
+
+    // Check if user has access to the workspace
+    const userWorkspace = await db
+      .select()
+      .from(userWorkspaces)
+      .where(
+        and(
+          eq(userWorkspaces.workspace_id, workspace_id),
+          eq(userWorkspaces.user_id, userId)
+        )
+      )
+      .limit(1);
+
+    if (userWorkspace.length === 0 || userWorkspace[0].role === 'viewer') {
+      return NextResponse.json(
+        { success: false, error: 'Insufficient permissions to create pages' },
+        { status: 403 }
+      );
+    }
+
+    // Generate slug from title
+    const slug = title
+      .toLowerCase()
+      .trim()
+      .replace(/[^\w\s-]/g, '')
+      .replace(/[\s_-]+/g, '-')
+      .replace(/^-+|-+$/g, '');
+
+    // Get sort order (add to end)
+    const [lastPage] = await db
+      .select({ sort_order: pages.sort_order })
+      .from(pages)
+      .where(
+        and(
+          eq(pages.workspace_id, workspace_id),
+          parent_id ? eq(pages.parent_id, parent_id) : isNull(pages.parent_id)
+        )
+      )
+      .orderBy(desc(pages.sort_order))
+      .limit(1);
+
+    const sortOrder = (lastPage?.sort_order || 0) + 1;
+
+    // Create the page
+    const [newPage] = await db
+      .insert(pages)
+      .values({
+        title: title.trim(),
+        slug,
+        workspace_id,
+        parent_id: parent_id || null,
+        icon: icon || null,
+        sort_order: sortOrder,
+        created_by: userId,
+        last_edited_by: userId,
+      })
+      .returning();
+
+    // If creating from template, copy template content
+    if (template_id) {
+      // TODO: Implement template copying
+      console.log('Template copying not implemented yet');
+    } else {
+      // Create initial empty paragraph block
+      await db
+        .insert(blocks)
+        .values({
+          page_id: newPage.id,
+          type: 'paragraph',
+          content: { text: '' },
+          sort_order: 0,
+          created_by: userId,
+          last_edited_by: userId,
+        });
+    }
+
+    const response = {
+      success: true,
+      data: newPage,
+      message: 'Page created successfully',
+    };
+
+    return NextResponse.json(response, { status: 201 });
+  } catch (error) {
+    console.error('Error creating page:', error);
+    
+    return NextResponse.json(
+      {
+        success: false,
+        error: 'Failed to create page',
+        details: process.env.NODE_ENV === 'development' ? error : undefined,
+      },
+      { status: 500 }
+    );
+  }
+}
